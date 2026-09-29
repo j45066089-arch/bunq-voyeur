@@ -1,0 +1,9 @@
+Package: com.maurice.bunqvoyeur
+Name: bunqVoyeur
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: Loggt entschlüsselte bunq-Server-Antworten (JSON) in den Sandbox-Documents-Ordner
+Maintainer: Maurice
+Author: Maurice
+Section: Tweaks
+Depends: mobilesubstrate
