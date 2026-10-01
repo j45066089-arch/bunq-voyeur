@@ -7,7 +7,8 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = bunqVoyeur
 
 bunqVoyeur_FILES = Tweak.x
-bunqVoyeur_CFLAGS = -fobjc-arc -F$(THEOS)/sdks/iPhoneOS$(TARGET_VERSION).sdk/System/Library/Frameworks
+CFLAGS = -fobjc-arc
+# kein libsubstrate -- reiner ctor-Test
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
