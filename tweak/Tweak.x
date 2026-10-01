@@ -1,141 +1,151 @@
 #include <substrate.h>
 #include <Foundation/Foundation.h>
-#include <objc/runtime.h>
+#include <sys/time.h>
 
-// ============================================================
-// bunqVoyeur v2 — fängt entschlüsselte bunq-JSONs ab
-// ------------------------------------------------------------
-// Swift's JSONDecoder/Codable geht auf Apple-Plattformen intern
-// durch NSJSONSerialization -> wir sehen den Klartext NACH der
-// bunq-E2E-Entschlüsselung, genau wenn die App ihn parst.
-//
-// Log: <bunq-Container>/Documents/bunqvoyeur_log.jsonl
-// ============================================================
+// bunqVoyeur v3 — beobachtet Incode/Sardine/Verification-Traffic von bunq.
+// Korrekturen vs. v2:
+//   1. Block-Parameter als ECHTE Block-Typen (nicht `id`) -> arm64e ABI ok.
+//   2. Log an SSH-sichtbaren absoluten Pfad /var/mobile/Documents/bunqVoyeur/
+//      (ueberlebt Crane-Container-Wechsel + bunq-Neuinstallation) UND
+//      zusaetzlich in den App-Container als Fallback.
+//   3. Heartbeat im ctor beweist Injektion positiv (auch unter Sandbox).
 
-static NSString *logPath(void) {
-    static NSString *p = nil;
-    if (!p) {
-        NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        p = [doc stringByAppendingPathComponent:@"bunqvoyeur_log.jsonl"];
-    }
-    return p;
+static NSString *now(void) {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return [NSString stringWithFormat:@"%ld.%03ld", (long)tv.tv_sec, (long)tv.tv_usec / 1000];
 }
 
-static BOOL interesting(NSString *s) {
-    if (!s || s.length < 4) return NO;
-    static NSArray *markers = nil;
-    if (!markers) {
-        markers = @[@"identity", @"verification", @"incode", @"selfie", @"liveness",
-                    @"rejected", @"approved", @"declined", @"face", @"onboarding",
-                    @"user_identification", @"verificationStatus", @"session_status"];
+static NSArray<NSString *> *logDirs(void) {
+    static NSArray *dirs = nil;
+    if (!dirs) {
+        NSMutableArray *a = [NSMutableArray arrayWithObject:@"/var/mobile/Documents/bunqVoyeur"];
+        NSString *home = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (home) [a addObject:[home stringByAppendingPathComponent:@"bunqVoyeur"]];
+        dirs = [a copy];
     }
-    NSString *low = [s lowercaseString];
-    for (NSString *m in markers) {
-        if ([low containsString:m]) return YES;
+    return dirs;
+}
+
+static void logLine(NSString *file, NSString *line) {
+    @try {
+        NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+        for (NSString *dir in logDirs()) {
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *p = [dir stringByAppendingPathComponent:file];
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+            if (!fh) {
+                [d writeToFile:p atomically:NO]; // erste Zeile legt Datei an
+                fh = [NSFileHandle fileHandleForWritingAtPath:p];
+            }
+            [fh seekToEndOfFile];
+            [fh writeData:d];
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {}
+}
+
+static BOOL interestingURL(NSURL *url) {
+    if (!url || !url.absoluteString) return NO;
+    NSString *s = url.absoluteString.lowercaseString;
+    for (NSString *k in @[@"incode", @"incodesmile", @"sardine", @"identity-verification",
+                          @"user-identification", @"deviceservice", @"onboarding"]) {
+        if ([s containsString:k]) return YES;
     }
     return NO;
 }
 
-static void appendLog(NSString *payload, NSUInteger cap) {
-    @try {
-        if (payload.length > cap) {
-            payload = [payload substringToIndex:cap];
-        }
-        NSDateFormatter *df = [[NSDateFormatter alloc] init];
-        df.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
-        NSString *ts = [df stringFromDate:[NSDate date]];
-        NSString *line = [NSString stringWithFormat:@"%@ | %@\n", ts, payload];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath()];
-        if (!fh) {
-            [[NSFileManager defaultManager] createFileAtPath:logPath() contents:nil attributes:nil];
-            fh = [NSFileHandle fileHandleForWritingAtPath:logPath()];
-        }
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    } @catch (NSException *e) {}
+static NSString *bodyDesc(NSData *d) {
+    if (!d) return @"<nil>";
+    if (d.length > 40000) return [NSString stringWithFormat:@"<%lu bytes truncated>", (unsigned long)d.length];
+    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (s) return s;
+    s = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
+    if (s) return s;
+    return [NSString stringWithFormat:@"<binary %lu bytes>", (unsigned long)d.length];
 }
 
-// ---------- Parsen eingehender JSON-Antworten ----------
-static id (*orig_JSONObjectWithData)(id, SEL, NSData *, NSJSONReadingOptions, NSError **);
-static id hook_JSONObjectWithData(id self, SEL _cmd, NSData *data, NSJSONReadingOptions opt, NSError **err) {
-    id result = orig_JSONObjectWithData(self, _cmd, data, opt, err);
-    if (result && data.length > 2) {
-        @try {
-            NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (s && interesting(s)) {
-                appendLog([NSString stringWithFormat:@"[JSON-IN len=%lu] %@", (unsigned long)s.length, s], 20000);
-            }
-        } @catch (NSException *e) {}
-    }
-    return result;
+static void logRequest(NSURLRequest *req, NSString *kind, NSString *extra) {
+    logLine(@"requests.log", [NSString stringWithFormat:@"[%@] %@ %@ %@\n  BODY: %@%@\n",
+        now(), kind, req.HTTPMethod ?: @"-", req.URL.absoluteString ?: @"-",
+        bodyDesc(req.HTTPBody), extra ?: @""]);
 }
 
-// ---------- Serialisieren ausgehender JSON-Requests ----------
-static NSData *(*orig_JSONWithObject)(id, SEL, id, NSJSONWritingOptions, NSError **);
-static NSData *hook_JSONWithObject(id self, SEL _cmd, id obj, NSJSONWritingOptions opt, NSError **err) {
-    NSData *d = orig_JSONWithObject(self, _cmd, obj, opt, err);
-    if (d && d.length > 2) {
-        @try {
-            NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-            if (s && interesting(s)) {
-                appendLog([NSString stringWithFormat:@"[JSON-OUT len=%lu] %@", (unsigned long)s.length, s], 8000);
-            }
-        } @catch (NSException *e) {}
-    }
-    return d;
+static void logResponse(NSURLResponse *resp, NSData *data, NSError *err, NSString *prefix) {
+    NSString *status = @"";
+    if ([resp isKindOfClass:NSHTTPURLResponse.class])
+        status = [NSString stringWithFormat:@" status=%ld", (long)((NSHTTPURLResponse *)resp).statusCode];
+    logLine(@"responses.log", [NSString stringWithFormat:@"[%@] %@ %@%@ err=%@\n  BODY: %@\n",
+        now(), prefix, resp.URL.absoluteString ?: @"-", status, err ?: @"-", bodyDesc(data)]);
 }
 
-// ---------- NSCoding-Archive ----------
-static id (*orig_UnarchiveTop)(id, SEL, NSData *, NSError **);
-static id hook_UnarchiveTop(id self, SEL _cmd, NSData *data, NSError **err) {
-    id result = orig_UnarchiveTop(self, _cmd, data, err);
-    if (result && data.length > 2) {
-        @try {
-            NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (s && interesting(s)) {
-                appendLog([NSString stringWithFormat:@"[UNARCHIVE len=%lu] %@", (unsigned long)s.length, s], 20000);
-            }
-        } @catch (NSException *e) {}
-    }
-    return result;
+// ============ NSURLSession dataTaskWithRequest:completionHandler: ============
+static NSURLSessionDataTask *(*orig_dataTaskCB)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
+static NSURLSessionDataTask *hook_dataTaskCB(id self, SEL _cmd, NSURLRequest *req, void (^cb)(NSData *, NSURLResponse *, NSError *)) {
+    if (interestingURL(req.URL))
+        logRequest(req, @"DATA-CB", nil);
+    void (^nc)(NSData *, NSURLResponse *, NSError *) = ^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (r && interestingURL(r.URL)) logResponse(r, d, e, @"DATA-RESP");
+        if (cb) cb(d, r, e);
+    };
+    return orig_dataTaskCB(self, _cmd, req, nc);
 }
 
-// ---------- URL-Kontext (verification-Endpoints) ----------
-// Block-Parameter ist ABI-mäßig ein Pointer -> als id deklariert
-static NSURLSessionDataTask *(*orig_dataTask)(id, SEL, NSURLRequest *, id);
-static NSURLSessionDataTask *hook_dataTask(id self, SEL _cmd, NSURLRequest *req, id handler) {
-    NSString *url = req.URL.absoluteString;
-    if (url && ([url containsString:@"identity-verification"] ||
-                [url containsString:@"incode"] ||
-                [url containsString:@"user-identification"])) {
-        appendLog([NSString stringWithFormat:@"[REQ-URL] %@", url], 2000);
+// ============ NSURLSession dataTaskWithRequest: (kein Handler) ============
+static NSURLSessionDataTask *(*orig_dataTask)(id, SEL, NSURLRequest *);
+static NSURLSessionDataTask *hook_dataTask(id self, SEL _cmd, NSURLRequest *req) {
+    if (interestingURL(req.URL))
+        logRequest(req, @"DATA", nil);
+    return orig_dataTask(self, _cmd, req);
+}
+
+// ============ NSURLSession uploadTask fromData ============
+static NSURLSessionUploadTask *(*orig_uploadData)(id, SEL, NSURLRequest *, NSData *, void (^)(NSData *, NSURLResponse *, NSError *));
+static NSURLSessionUploadTask *hook_uploadData(id self, SEL _cmd, NSURLRequest *req, NSData *body, void (^cb)(NSData *, NSURLResponse *, NSError *)) {
+    if (interestingURL(req.URL))
+        logRequest(req, @"UPLOAD-DATA", [NSString stringWithFormat:@"\n  UPLOAD: %@", bodyDesc(body)]);
+    void (^nc)(NSData *, NSURLResponse *, NSError *) = ^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (r && interestingURL(r.URL)) logResponse(r, d, e, @"UP-RESP");
+        if (cb) cb(d, r, e);
+    };
+    return orig_uploadData(self, _cmd, req, body, nc);
+}
+
+// ============ NSURLSession uploadTask fromFile ============
+static NSURLSessionUploadTask *(*orig_uploadFile)(id, SEL, NSURLRequest *, NSURL *, void (^)(NSData *, NSURLResponse *, NSError *));
+static NSURLSessionUploadTask *hook_uploadFile(id self, SEL _cmd, NSURLRequest *req, NSURL *file, void (^cb)(NSData *, NSURLResponse *, NSError *)) {
+    if (interestingURL(req.URL)) {
+        NSString *sz = @"";
+        NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:file.path error:nil];
+        if (a[NSFileSize]) sz = [NSString stringWithFormat:@" file_size=%@", a[NSFileSize]];
+        logRequest(req, @"UPLOAD-FILE", sz);
     }
-    return orig_dataTask(self, _cmd, req, handler);
+    return orig_uploadFile(self, _cmd, req, file, cb);
+}
+
+// ============ NSURLConnection sendAsynchronousRequest ============
+static void (*orig_sendAsync)(id, SEL, NSURLRequest *, NSOperationQueue *, void (^)(NSURLResponse *, NSData *, NSError *));
+static void hook_sendAsync(id self, SEL _cmd, NSURLRequest *req, NSOperationQueue *q, void (^cb)(NSURLResponse *, NSData *, NSError *)) {
+    if (interestingURL(req.URL))
+        logRequest(req, @"CONN-ASYNC", nil);
+    orig_sendAsync(self, _cmd, req, q, cb);
 }
 
 __attribute__((constructor))
 static void init(void) {
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    NSString *bid = NSBundle.mainBundle.bundleIdentifier;
+    logLine(@"heartbeat.txt", [NSString stringWithFormat:@"[%@] ctor bundle=%@", now(), bid ?: @"nil"]);
     if (![bid isEqualToString:@"com.bunq.ios"]) return;
+    logLine(@"heartbeat.txt", [NSString stringWithFormat:@"[%@] BUNQ hooking", now()]);
 
-    MSHookMessageEx([NSJSONSerialization class],
-                    @selector(JSONObjectWithData:options:error:),
-                    (IMP)&hook_JSONObjectWithData,
-                    (IMP *)&orig_JSONObjectWithData);
-
-    MSHookMessageEx([NSJSONSerialization class],
-                    @selector(dataWithJSONObject:options:error:),
-                    (IMP)&hook_JSONWithObject,
-                    (IMP *)&orig_JSONWithObject);
-
-    MSHookMessageEx([NSKeyedUnarchiver class],
-                    @selector(unarchiveTopLevelObjectWithData:error:),
-                    (IMP)&hook_UnarchiveTop,
-                    (IMP *)&orig_UnarchiveTop);
-
-    MSHookMessageEx([NSURLSession class],
-                    @selector(dataTaskWithRequest:completionHandler:),
-                    (IMP)&hook_dataTask,
-                    (IMP *)&orig_dataTask);
+    MSHookMessageEx(NSURLSession.class, @selector(dataTaskWithRequest:completionHandler:),
+                    (IMP)hook_dataTaskCB, (IMP *)&orig_dataTaskCB);
+    MSHookMessageEx(NSURLSession.class, @selector(dataTaskWithRequest:),
+                    (IMP)hook_dataTask, (IMP *)&orig_dataTask);
+    MSHookMessageEx(NSURLSession.class, @selector(uploadTaskWithRequest:fromData:completionHandler:),
+                    (IMP)hook_uploadData, (IMP *)&orig_uploadData);
+    MSHookMessageEx(NSURLSession.class, @selector(uploadTaskWithRequest:fromFile:completionHandler:),
+                    (IMP)hook_uploadFile, (IMP *)&orig_uploadFile);
+    MSHookMessageEx(NSURLConnection.class, @selector(sendAsynchronousRequest:queue:completionHandler:),
+                    (IMP)hook_sendAsync, (IMP *)&orig_sendAsync);
+    logLine(@"heartbeat.txt", [NSString stringWithFormat:@"[%@] hooks installiert", now()]);
 }
